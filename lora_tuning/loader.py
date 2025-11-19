@@ -154,6 +154,10 @@ def describe_net(net):
         if w.policy.HasField('bn_means'):
             print("    Has BN")
             
+    # Policy Format
+    if net.HasField('format') and net.format.HasField('network_format'):
+        print(f"  Policy Format: {net.format.network_format.policy}")
+            
     # Policy Head FC
     if w.HasField('ip_pol_w'):
          pw = decode_layer(w.ip_pol_w)

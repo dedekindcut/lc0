@@ -31,7 +31,15 @@ uv run loader.py path/to/network.pb.gz
 uv run test_model.py path/to/network.pb.gz
 ```
 
+### 4. Train
+```bash
+uv run train.py --network path/to/network.pb.gz --data path/to/training/chunks --output tuned.pb.gz
+```
+
 ## Files
 - `loader.py`: Handles reading/writing Lc0 protobuf weights and quantizing/dequantizing.
 - `model.py`: PyTorch model definition (Lc0Net, LoRALayer, MHA, etc.) that mirrors the Lc0 C++ inference code.
 - `test_model.py`: Verification script.
+- `train.py`: Training loop using LoRA.
+- `dataset.py`: PyTorch IterableDataset wrapping `chunkparser.py`.
+- `chunkparser.py`: (From lczero-training) Parsing logic for binary training data.

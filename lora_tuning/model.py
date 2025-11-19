@@ -320,12 +320,20 @@ class LC0ResBlock(nn.Module):
         out += residual
         return F.relu(out)
 
+import lc0_az_policy_map
+
 class LC0Net(nn.Module):
     def __init__(self, proto_net):
         super().__init__()
         self.proto_net = proto_net
         w = proto_net.weights
         
+        # Check Policy Format
+        # Default to Classical (1) if not set
+        self.policy_format = 1
+        if proto_net.HasField('format') and proto_net.format.HasField('network_format'):
+            self.policy_format = proto_net.format.network_format.policy
+            
         self.is_transformer = len(w.encoder) > 0
         
         if self.is_transformer:
@@ -391,6 +399,46 @@ class LC0Net(nn.Module):
             # Use dynamic filters
             f = self.model_dim if self.is_transformer else self.filters
             self.policy_conv = LC0ConvBlock(w.policy, f, activation=True)
+            
+            # Policy FC
+            # Check if weights exist
+            if w.HasField('ip_pol_w'):
+                pw = loader.decode_layer(w.ip_pol_w)
+                pb = loader.decode_layer(w.ip_pol_b)
+                # Assuming 1858 output
+                out_dim = 1858
+                in_dim = pw.size // out_dim
+                
+                self.pol_fc = nn.Linear(in_dim, out_dim)
+                self.pol_fc.weight.data.copy_(torch.from_numpy(pw).view(out_dim, in_dim))
+                self.pol_fc.bias.data.copy_(torch.from_numpy(pb))
+            elif self.policy_format == 2: # POLICY_CONVOLUTION
+                # Auto-generate FC layer from AZ mapping
+                # Input: (B, 80, 8, 8) -> Flatten -> (B, 5120)
+                # Output: 1858
+                # Map: kConvPolicyMap[src_idx] = dst_idx
+                
+                print("Converting POLICY_CONVOLUTION to Linear layer...")
+                mapping_indices = lc0_az_policy_map.make_map(kind='index')
+                # mapping_indices is list of length 5120. Values are 0..1857 or -1.
+                
+                in_dim = 80 * 8 * 8
+                out_dim = 1858
+                
+                self.pol_fc = nn.Linear(in_dim, out_dim)
+                # Init to zero
+                self.pol_fc.weight.data.zero_()
+                self.pol_fc.bias.data.zero_()
+                
+                # Set identity
+                with torch.no_grad():
+                    for src_i, dst_i in enumerate(mapping_indices):
+                        if dst_i >= 0:
+                            self.pol_fc.weight[dst_i, src_i] = 1.0
+                            
+                # Update proto format to CLASSICAL so we save it correctly
+                # But wait, we need to add ip_pol_w/b to proto when saving.
+                
         elif w.HasField('policy_heads'):
             # Handle policy heads
             pass
@@ -421,10 +469,20 @@ class LC0Net(nn.Module):
             if w.HasField('ip2_val_w'):
                 w2 = loader.decode_layer(w.ip2_val_w)
                 b2 = loader.decode_layer(w.ip2_val_b)
-                out_dim = w2.size // 128 # Assuming in=128
                 
-                self.val_fc2 = nn.Linear(128, out_dim)
-                self.val_fc2.weight.data.copy_(torch.from_numpy(w2).view(out_dim, 128))
+                # Infer in_dim from previous layer (fc1 out)
+                # We assumed fc1 out is 128 or 256. 
+                # For badgyal it was 128.
+                # Let's use self.val_fc1.out_features if available
+                if hasattr(self, 'val_fc1'):
+                    in_dim = self.val_fc1.out_features
+                else:
+                    in_dim = 128 # Fallback
+                    
+                out_dim = w2.size // in_dim
+                
+                self.val_fc2 = nn.Linear(in_dim, out_dim)
+                self.val_fc2.weight.data.copy_(torch.from_numpy(w2).view(out_dim, in_dim))
                 self.val_fc2.bias.data.copy_(torch.from_numpy(b2))
             
     def forward(self, x):
@@ -453,6 +511,9 @@ class LC0Net(nn.Module):
         if hasattr(self, 'policy_conv'):
              p = self.policy_conv(x)
              # Handle FC if present
+             if hasattr(self, 'pol_fc'):
+                 p = p.flatten(1)
+                 p = self.pol_fc(p)
              
         # Value
         v = None
@@ -463,7 +524,13 @@ class LC0Net(nn.Module):
                 v = F.relu(self.val_fc1(v))
             if hasattr(self, 'val_fc2'):
                 v = self.val_fc2(v)
-            v = torch.tanh(v)
+                
+            # Activation depends on output dim
+            # 1 -> Tanh (Classical)
+            # 3 -> Softmax (WDL) - but return logits for training
+            if v.shape[1] == 1:
+                v = torch.tanh(v)
+            # Else (3): return logits
             
         return p, v
 
@@ -495,6 +562,9 @@ class LC0Net(nn.Module):
         # Apply to Heads
         if hasattr(self, 'policy_conv') and isinstance(self.policy_conv.conv, nn.Conv2d):
             self.policy_conv.conv = replace_linear_or_conv(self.policy_conv.conv)
+            
+        if hasattr(self, 'pol_fc') and isinstance(self.pol_fc, nn.Linear):
+            self.pol_fc = replace_linear_or_conv(self.pol_fc)
         
         if hasattr(self, 'value_conv') and isinstance(self.value_conv.conv, nn.Conv2d):
             self.value_conv.conv = replace_linear_or_conv(self.value_conv.conv)
@@ -595,6 +665,27 @@ class LC0Net(nn.Module):
         if hasattr(self, 'policy_conv'):
              update_conv_block(w.policy, self.policy_conv)
              
+             if hasattr(self, 'pol_fc'):
+                 # If we converted from FORMAT 2, we need to ensure weights exist
+                 if not w.HasField('ip_pol_w'):
+                     # We need to allocate them?
+                     # But python proto object can assign directly.
+                     pass
+                 
+                 # If using LoRA on FC
+                 layer = self.pol_fc
+                 if isinstance(layer, LoRALayer):
+                     layer = layer.bake()
+                     
+                 update_layer(w.ip_pol_w, layer.weight)
+                 update_layer(w.ip_pol_b, layer.bias)
+                 
+                 # Update format to CLASSICAL if it was CONVOLUTION
+                 if w.HasField('policy1'): # Format 2 characteristic
+                     # Actually we should check self.policy_format
+                     # But modifying format is safer at top level
+                     pass
+                     
         if hasattr(self, 'value_conv'):
              update_conv_block(w.value, self.value_conv)
              
@@ -607,6 +698,11 @@ class LC0Net(nn.Module):
                  update_layer(w.ip2_val_b, self.val_fc2.bias)
                  
         # Save to file
+        # Update Policy Format to CLASSICAL if we have FC
+        if hasattr(self, 'pol_fc') and self.proto_net.format.network_format.policy == 2:
+            print("Updating policy format from CONVOLUTION to CLASSICAL...")
+            self.proto_net.format.network_format.policy = 1 # POLICY_CLASSICAL
+            
         # Gzip it
         import gzip
         with gzip.open(filename, 'wb') as f:
