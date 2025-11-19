@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.7"
 dependencies = [
+    "chess>=1.10.0",
     "grpcio-tools>=1.62.3",
     "numpy>=1.21.6",
     "protobuf>=4.24.4",

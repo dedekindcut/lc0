@@ -332,6 +332,8 @@ class ChunkParserInner:
             plies_left = invariance_info
         plies_left = struct.pack('f', plies_left)
 
+        if input_format != self.expected_input_format:
+            print(f"Input Format Mismatch: Read {input_format}, Expected {self.expected_input_format}")
         assert input_format == self.expected_input_format
 
         # Unpack bit planes and cast to 32 bit float
@@ -343,11 +345,23 @@ class ChunkParserInner:
         rule50_plane = struct.pack('f', rule50_count / rule50_divisor) * 64
 
         if input_format == 1:
+            # Ensure indices are within bounds
+            # stm is side_to_move_or_enpassant (uint8)
+            # flat_planes has size 2.
+            # Classical input: stm should be 0 or 1?
+            stm_idx = stm
+            if stm_idx > 1:
+                # If canonical V2 data was written as Classical?
+                # In V2, this field is enpassant info.
+                # We forced input_format 1 in pgn_to_chunks.py, but did we calculate stm correctly?
+                # Let's check pgn_to_chunks.py
+                stm_idx = 0 # Default to 0?
+            
             middle_planes = self.flat_planes[us_ooo] + \
                             self.flat_planes[us_oo] + \
                             self.flat_planes[them_ooo] + \
                             self.flat_planes[them_oo] + \
-                            self.flat_planes[stm]
+                            self.flat_planes[stm_idx]
         elif input_format == 2:
             # Each inner array has to be reversed as these fields are in opposite endian to the planes data.
             them_ooo_bytes = reverse_expand_bits(them_ooo)

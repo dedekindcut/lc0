@@ -25,3 +25,8 @@ dist = []
 setup = ["-Dpython_bindings=true"]
 compile = []
 install = []
+
+[tool.uv.workspace]
+members = [
+    "lora_tuning",
+]

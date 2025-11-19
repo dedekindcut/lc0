@@ -6,12 +6,13 @@ import os
 import chunkparser
 
 class Lc0Dataset(IterableDataset):
-    def __init__(self, data_dir, batch_size=256, workers=4, shuffle_size=524288):
+    def __init__(self, data_dir, batch_size=256, workers=4, shuffle_size=524288, input_format=5):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.workers = workers
         self.shuffle_size = shuffle_size
+        self.input_format = input_format
         
         # Find all chunk files
         # Lc0 training data is usually in .gz files inside subdirectories
@@ -46,14 +47,20 @@ class Lc0Dataset(IterableDataset):
         
         parser = chunkparser.ChunkParser(
             self.chunks,
-            expected_input_format=5, # Try 5 first
+            expected_input_format=self.input_format, 
             shuffle_size=self.shuffle_size,
             batch_size=self.batch_size,
             workers=self.workers
         )
         
+        # If workers=0, use sequential
+        if self.workers <= 0:
+            gen = parser.sequential()
+        else:
+            gen = parser.parse()
+        
         # Iterating parser.parse() yields batches of BYTES
-        for batch_bytes in parser.parse():
+        for batch_bytes in gen:
             # batch_bytes is tuple: (planes, probs, winner, q, plies_left)
             # unpack
             

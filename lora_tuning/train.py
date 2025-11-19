@@ -1,6 +1,7 @@
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import os
@@ -40,8 +41,14 @@ def train(args):
     print(f"Trainable params: {trainable_params} / {all_params} ({trainable_params/all_params:.2%})")
     
     # 3. Setup Data
+    # Get input format from network
+    input_format = 5 # Default
+    if net_proto.HasField('format') and net_proto.format.HasField('network_format'):
+        input_format = net_proto.format.network_format.input
+        print(f"Using input format {input_format} from network.")
+        
     print(f"Initializing dataset from {args.data}...")
-    ds = dataset.Lc0Dataset(args.data, batch_size=args.batch_size, workers=args.workers)
+    ds = dataset.Lc0Dataset(args.data, batch_size=args.batch_size, workers=args.workers, input_format=input_format)
     # Using num_workers=0 because ChunkParser manages its own processes
     train_loader = DataLoader(ds, batch_size=None, num_workers=0) 
     

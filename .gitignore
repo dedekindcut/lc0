@@ -19,3 +19,11 @@ xcuserdata
 compile_flags.txt
 .vscode
 .mesonpy*
+
+# LoRA Tuning
+tuned_badgyal.pb.gz
+badgyal_lora_test.pb.gz
+lora_tuning/data/
+lora_tuning/*.gz
+temp_data/
+*.pb.gz
