@@ -143,6 +143,10 @@ def describe_net(net):
             print("    Block 0 has MHA")
             if e.mha.HasField('q_w'):
                 print(f"      Q Weights: {decode_layer(e.mha.q_w).shape}")
+            if e.mha.HasField('rpe_q'):
+                print(f"      Has RPE_Q: {decode_layer(e.mha.rpe_q).shape}")
+            if e.mha.HasField('rpe_k'):
+                print(f"      Has RPE_K: {decode_layer(e.mha.rpe_k).shape}")
         if e.HasField('ffn'):
             print("    Block 0 has FFN")
 

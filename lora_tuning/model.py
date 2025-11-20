@@ -4,6 +4,19 @@ import torch.nn.functional as F
 import numpy as np
 import math
 
+def make_rpe_map():
+    # 15 * 15 in units for distance pairs to 64 * 64 pairs of squares
+    out = np.zeros((225, 64*64), dtype=np.float32)
+    for i in range(8):
+        for j in range(8):
+            for k in range(8):
+                for l in range(8):
+                    out[15 * (i-k+7) + (j - l + 7), 64 * (i*8+j) + k*8+l] = 1
+    return out
+
+# Cache global map
+RPE_MAP = torch.from_numpy(make_rpe_map()).float()
+
 # Import loader to decode layers
 import loader
 
@@ -196,6 +209,46 @@ class SEUnit(nn.Module):
         # output = input * sigmoid(w) + b
         return x * scale + bias
 
+class RPELogits(nn.Module):
+    def __init__(self, proto_layer, head_depth, head_count, rpe_type='q'):
+        super().__init__()
+        self.head_depth = head_depth
+        self.head_count = head_count
+        self.rpe_type = rpe_type
+        
+        # proto_layer is Layer
+        w_np = loader.decode_layer(proto_layer)
+        # Shape: (head_depth * head_count, 225)
+        # Verify size
+        expected_size = head_depth * head_count * 225
+        if w_np.size != expected_size:
+             # It's possible dimensions are different if we inferred wrong.
+             pass
+             
+        self.rpe_w = nn.Parameter(torch.from_numpy(w_np).view(head_depth * head_count, 225))
+        # We freeze RPE weights by default as we don't LoRA them
+        self.rpe_w.requires_grad = False
+        
+    def forward(self, x):
+        # x: (B, H, 64, D) (transposed q/k)
+        # self.rpe_w: (D*H, 225)
+        # RPE_MAP: (225, 4096)
+        # Bias = rpe_w @ map -> (D*H, 4096)
+        
+        bias = self.rpe_w @ RPE_MAP.to(x.device) # (D*H, 4096)
+        bias = bias.view(self.head_depth, self.head_count, 64, 64) # (D, H, Q, K)
+        
+        # Einsum
+        # if q: x is (B, H, Q, D). bias is (D, H, Q, K)
+        # output (B, H, Q, K)
+        # eq: bhqd, dhqk -> bhqk
+        
+        # PyTorch einsum:
+        if self.rpe_type == 'q':
+            return torch.einsum('bhqd, dhqk -> bhqk', x, bias)
+        else:
+            return torch.einsum('bhkd, dhqk -> bhqk', x, bias)
+
 class MHA(nn.Module):
     def __init__(self, proto_mha, model_dim, heads):
         super().__init__()
@@ -224,21 +277,33 @@ class MHA(nn.Module):
         load_linear(self.out_proj, proto_mha.dense_w, proto_mha.dense_b)
         
         # Relative Positional Encodings (RPE)
-        # Usually: (heads, R) or something
-        # Not implementing forward pass for RPE yet as it's complex
-        # But we can load weights if needed
+        self.rpe_q = None
+        self.rpe_k = None
+        
+        if proto_mha.HasField('rpe_q'):
+            self.rpe_q = RPELogits(proto_mha.rpe_q, self.head_dim, self.heads, 'q')
+        if proto_mha.HasField('rpe_k'):
+            self.rpe_k = RPELogits(proto_mha.rpe_k, self.head_dim, self.heads, 'k')
         
     def forward(self, x):
         # x: (B, Seq, Dim)
         B, Seq, _ = x.shape
         
+        # View as (B, Seq, H, D) then transpose to (B, H, Seq, D) for dot product attention
         q = self.q_proj(x).view(B, Seq, self.heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, Seq, self.heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, Seq, self.heads, self.head_dim).transpose(1, 2)
         
         # Scaled Dot-Product Attention
-        scores = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
-        # Apply RPE here...
+        scores = (q @ k.transpose(-2, -1)) # (B, H, Seq, Seq)
+        
+        # Apply RPE
+        if self.rpe_q:
+            scores = scores + self.rpe_q(q)
+        if self.rpe_k:
+            scores = scores + self.rpe_k(k)
+            
+        scores = scores / (self.head_dim ** 0.5)
         
         attn = F.softmax(scores, dim=-1)
         out = attn @ v
