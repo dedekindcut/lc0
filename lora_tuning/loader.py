@@ -153,7 +153,10 @@ def describe_net(net):
     # Policy Head
     if w.HasField('policy'):
         p = decode_layer(w.policy.weights)
-        print(f"  Policy Head Conv: {p.shape}")
+        if p is not None:
+            print(f"  Policy Head Conv: {p.shape}")
+        else:
+            print("  Policy Head Conv: (weights missing in proto?)")
         # Check params
         if w.policy.HasField('bn_means'):
             print("    Has BN")

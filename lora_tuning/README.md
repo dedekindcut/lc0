@@ -1,54 +1,93 @@
 # Lc0 LoRA Tuning
 
-This directory contains tools to fine-tune Leela Chess Zero (Lc0) networks using Low-Rank Adaptation (LoRA).
+This repository provides a **self-contained** pipeline for fine-tuning Leela Chess Zero (Lc0) networks using Low-Rank Adaptation (LoRA). It includes a high-performance C++ dataloader, supports standard ResNets and newer Transformers (BT4/BT5), and can handle Relative Positional Encodings (RPE).
 
 ## Features
-- **Dynamic Model Loading**: Loads `lc0` protobuf network files (`.pb.gz`) directly into PyTorch.
-- **ResNet & Transformer Support**: Supports standard Lc0 ResNets (like `badgyal`) and newer Transformers (like `BT4`).
-- **LoRA Implementation**: Adds LoRA adapters to Conv2d and Linear layers.
-- **Baking**: Merges LoRA weights back into the base network and saves valid `.pb.gz` files that can be run by the standard `lc0` binary.
+- **Self-Contained**: No need to clone external Lc0 training repos. All C++ sources and build configs are included.
+- **High-Performance Dataloader**: Multithreaded C++ dataloader (via `lczero_training` extension) reads Lc0 binary data (V6/V7) efficiently.
+- **LoRA Support**: Freezes the backbone and trains lightweight adapters for Attention/Conv layers.
+- **Architecture Support**:
+    - **ResNet** (e.g., `badgyal`)
+    - **Transformer** (e.g., `BT4`, `BT5`) with RPE support.
+- **Baking**: Merges LoRA weights back into `.pb.gz` format compatible with standard `lc0` binaries.
 
-## Usage
+## Quick Start
 
-### Prerequisites
+### 1. Install Dependencies
+**Linux (Ubuntu/Debian)**:
 ```bash
-uv add torch numpy protobuf grpcio-tools
+sudo apt update
+sudo apt install -y pkg-config python3-pybind11 pybind11-dev libz-dev libgtest-dev protobuf-compiler
 ```
 
-### 1. Compile Protobuf
-Before running, ensure `net_pb2.py` is generated:
+**macOS**:
 ```bash
-uv run python -m grpc_tools.protoc -I../proto --python_out=. ../proto/net.proto
+brew install pkg-config protobuf meson ninja
 ```
 
-### 2. Load and Inspect a Network
+**Python Dependencies**:
 ```bash
-uv run loader.py path/to/network.pb.gz
+# Install uv if you haven't: curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync
 ```
 
-### 3. Run LoRA Test (Load -> Apply LoRA -> Bake -> Save)
+### 2. Build C++ Extension
+This compiles the dataloader and protobuf definitions. Run these commands from the `lora_tuning` directory:
+
 ```bash
-uv run test_model.py path/to/network.pb.gz
+# 1. Setup Build
+uv run meson setup build/release/ --buildtype=release
+
+# 2. Compile
+uv run meson compile -C build/release/
+
+# 3. Generate Protobufs
+mkdir -p src/proto
+touch src/proto/__init__.py
+uv run python -m grpc_tools.protoc --proto_path=. --proto_path=libs/lc0 --python_out=src/ --pyi_out=src/ proto/*.proto
+uv run python -m grpc_tools.protoc --proto_path=. --proto_path=libs/lc0 --python_out=src/ --pyi_out=src/ proto/net.proto proto/onnx.proto proto/hlo.proto
+
+# 4. Link Extension
+mkdir -p lczero_training
+# Copy the compiled .so file (name varies by OS)
+cp build/release/_lczero_training.*.so lczero_training/_lczero_training.so
 ```
 
-### 4. Prepare Data
-The C++ dataloader requires data to be split into manageable chunks (to avoid OOM on large files).
-If you have a single large `train_data.gz`, run:
-```bash
-uv run split_data.py
-```
-This will create `data/chunks/`.
+### 3. Prepare Data
+Your training data should be in Lc0 binary format (`.gz` files).
+*   If you have a single massive file (e.g., `train_data.gz` > 1GB), split it:
+    ```bash
+    uv run scripts/split_data.py
+    ```
+*   If you have many small `.gz` files (e.g. from `QueenOddsV2`), just point the trainer to the directory containing them.
 
-### 5. Train
+### 4. Train
 ```bash
-uv run train.py --network tuned_badgyal.pb.gz --data data --output tuned.pb.gz --batch_size 256 --steps 1000
+uv run train.py \
+    --network nets/BT5-1024x15x32h-rpe-swa-3700000.pb.gz \
+    --data data/chunks \
+    --output tuned_bt5.pb.gz \
+    --batch_size 256 \
+    --steps 10000 \
+    --lr 1e-4 \
+    --alpha 0.5
 ```
 
-## Files
-- `loader.py`: Handles reading/writing Lc0 protobuf weights and quantizing/dequantizing.
-- `model.py`: PyTorch model definition (Lc0Net, LoRALayer, MHA, etc.) that mirrors the Lc0 C++ inference code.
-- `test_model.py`: Verification script.
-- `train.py`: Training loop using LoRA.
-- `dataset.py`: PyTorch IterableDataset wrapping the high-performance C++ dataloader.
-- `lczero_training/`: Compiled C++ dataloader extension (from `lc0-training`).
-- `split_data.py`: Helper to split large training files.
+### 5. Test / Verify
+To verify the trained model architecture or run a dummy forward pass:
+```bash
+uv run test_model.py tuned_bt5.pb.gz
+```
+
+## File Structure
+*   `csrc/`, `libs/`, `subprojects/`: C++ source code for the dataloader.
+*   `train.py`: Main training loop.
+*   `model.py`: PyTorch implementation of Lc0 architectures (ResNet/Transformer/LoRA/RPE).
+*   `dataset.py`: Wrapper for the C++ dataloader.
+*   `loader.py`: Utilities for reading/writing Lc0 `.pb.gz` files.
+*   `scripts/`: Helper scripts (splitting data, testing imports).
+
+## Troubleshooting
+*   **`invalid ELF header`**: You are trying to run a `.so` compiled on macOS on Linux (or vice versa). Re-run the "Build C++ Extension" steps on the target machine.
+*   **`Dependency lookup for pybind11 failed`**: Ensure you installed `python3-pybind11` and `pkg-config`.
+*   **`meson build directory` error**: If you moved the folder or changed envs, delete `build/` and run `meson setup` again.

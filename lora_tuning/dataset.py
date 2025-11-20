@@ -31,7 +31,7 @@ class Lc0Dataset(IterableDataset):
         # Stage 1: File Path Provider
         stage_fpp = config.stage.add()
         stage_fpp.name = "file_path_provider"
-        stage_fpp.file_path_provider.directory = os.path.join(self.data_dir, "chunks")
+        stage_fpp.file_path_provider.directory = self.data_dir
         stage_fpp.file_path_provider.output.queue_capacity = 16
 
         # Stage 2: Chunk Source Loader
