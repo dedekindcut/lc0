@@ -5,7 +5,6 @@ import os
 import sys
 
 # Ensure we can import the C++ extension and protobufs
-# Assuming they are in the same directory as this file
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 try:
@@ -46,8 +45,9 @@ class Lc0Dataset(IterableDataset):
         stage_scp = config.stage.add()
         stage_scp.name = "shuffling_chunk_pool"
         stage_scp.input.append("chunk_source_loader")
-        # Use a reasonable pool size. For local testing/finetuning, we might not have 50k chunks.
-        # Check if we can count files? For now use smaller pool if we assume small dataset.
+        # Use a reasonable pool size based on shuffle_size
+        # Assuming 1 chunk is roughly 1000 positions (standard V6/V7 chunk size varies)
+        # shuffle_size is in positions.
         stage_scp.shuffling_chunk_pool.chunk_pool_size = min(500, self.shuffle_size // 1000 + 1) 
         stage_scp.shuffling_chunk_pool.source_ingestion_threads = 1
         stage_scp.shuffling_chunk_pool.chunk_loading_threads = max(1, self.workers)
@@ -58,8 +58,7 @@ class Lc0Dataset(IterableDataset):
         stage_cu.name = "chunk_unpacker"
         stage_cu.input.append("shuffling_chunk_pool")
         stage_cu.chunk_unpacker.threads = max(1, self.workers)
-        stage_cu.chunk_unpacker.position_sampling_rate = 1.0 # Use all positions? Or sample?
-        # If fine-tuning on small dataset, maybe 1.0. If huge dataset, maybe 0.1.
+        stage_cu.chunk_unpacker.position_sampling_rate = 1.0 # Use all positions
         stage_cu.chunk_unpacker.output.queue_capacity = 16
 
         # Stage 5: Shuffling Frame Sampler
@@ -67,6 +66,7 @@ class Lc0Dataset(IterableDataset):
         stage_sfs.name = "shuffling_frame_sampler"
         stage_sfs.input.append("chunk_unpacker")
         stage_sfs.shuffling_frame_sampler.threads = max(1, self.workers)
+        # Reservoir size per thread
         stage_sfs.shuffling_frame_sampler.reservoir_size_per_thread = 1000
         stage_sfs.shuffling_frame_sampler.output.queue_capacity = 16
 
@@ -89,8 +89,7 @@ class Lc0Dataset(IterableDataset):
             self._init_loader()
             
         while True:
-            # Tuple of numpy arrays
-            # V6/V7 usually: (planes, probs, wdl, moves_left) or similar
+            # Returns tuple of numpy arrays
             try:
                 batch = self.loader.get_next()
             except Exception as e:
@@ -101,43 +100,25 @@ class Lc0Dataset(IterableDataset):
                 break
 
             # Map to expected keys
-            # Based on verify_loader output or standard LC0 format
-            # batch[0]: Input planes (B, 112, 8, 8)
+            # batch[0]: Input planes (B, 112, 8, 8) or flat
             # batch[1]: Policy (B, 1858)
             # batch[2]: Value/WDL (B, 3)
-            # batch[3]: Moves Left (B, 1) - Optional depending on config/format
             
             planes = batch[0]
             probs = batch[1]
             wdl = batch[2]
             
-            # Check if we have legacy format 
-            # batch[0] shape is likely (B, 112*64) or (B, 112, 8, 8)
-            # The C++ loader likely returns flat or structured? 
-            # tensor_generator.cc usually produces structured if configured, or flat.
-            # Let's assume we need to reshape if flat.
-            
             # Planes
             if planes.ndim == 2:
-                # (B, 112*64)
+                # (B, 112*64) -> (B, 112, 8, 8)
                 planes = planes.reshape(-1, 112, 8, 8)
-            
-            # Probs
-            # (B, 1858) - usually correct
-            
-            # WDL
-            # (B, 3) - usually correct
             
             result = {
                 'input': torch.from_numpy(planes),
                 'policy_target': torch.from_numpy(probs),
                 'value_target': torch.from_numpy(wdl),
-                'winner_target': torch.from_numpy(wdl) # Duplicate for now
+                'winner_target': torch.from_numpy(wdl)
             }
             
             yield result
-            
-    def __del__(self):
-        # Can't explicitly stop easily from here without keeping ref, 
-        # but Python GC should handle it if wrapper is good.
-        pass
+

@@ -41,15 +41,13 @@ def train(args):
     print(f"Trainable params: {trainable_params} / {all_params} ({trainable_params/all_params:.2%})")
     
     # 3. Setup Data
-    # Get input format from network
-    input_format = 5 # Default
+    input_format = 5 # Default if not found
     if net_proto.HasField('format') and net_proto.format.HasField('network_format'):
         input_format = net_proto.format.network_format.input
-        print(f"Using input format {input_format} from network.")
-        
+    
     print(f"Initializing dataset from {args.data}...")
     ds = dataset.Lc0Dataset(args.data, batch_size=args.batch_size, workers=args.workers, input_format=input_format)
-    # Using num_workers=0 because ChunkParser manages its own processes
+    # Using num_workers=0 because C++ Loader manages its own processes
     train_loader = DataLoader(ds, batch_size=None, num_workers=0) 
     
     # 4. Optimizer
@@ -76,29 +74,13 @@ def train(args):
         logs = {}
         
         # Policy Loss
-        # p_pred: (B, 1858) or similar logits
+        # p_pred: (B, 1858) logits
         # policy_target: (B, 1858) probabilities
-        # CrossEntropyLoss expects class indices usually, but we have soft targets (probs).
-        # So we use CrossEntropyLoss with probabilities (supported in recent PyTorch)
-        # Or manually: -sum(target * log_softmax(pred))
         
         if p_pred is not None:
-            # Check shapes
-            if p_pred.shape != policy_target.shape:
-                # Maybe Flatten issue?
-                # p_pred usually (B, C, H, W) from Conv?
-                if len(p_pred.shape) == 4:
-                    p_pred = p_pred.flatten(1) # Flatten to (B, C*H*W) or (B, 1858)
-                
-                # If size mismatch, we might have issue.
-                # ResNet policy head: 80 planes -> FC 1858.
-                # My model.py didn't fully implement the Policy FC for ResNet because weights were missing in badgyal proto?
-                # Wait, badgyal loader output: "Policy FC Weight" was NOT printed.
-                # "Policy Head Conv: (92160,)" -> 80 * 1152? 80*3*3*128 = 92160.
-                # So we have Policy Conv. But where is Policy FC?
-                # If Policy FC is missing in proto, we can't train policy head unless we re-init it?
-                # But badgyal MUST have policy FC.
-                pass
+            # Flatten if needed (B, C, H, W) -> (B, 1858)
+            if len(p_pred.shape) == 4:
+                p_pred = p_pred.flatten(1) 
             
             if p_pred.shape == policy_target.shape:
                 # target is probs, pred is logits

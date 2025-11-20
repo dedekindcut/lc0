@@ -320,8 +320,6 @@ class LC0ResBlock(nn.Module):
         out += residual
         return F.relu(out)
 
-import lc0_az_policy_map
-
 class LC0Net(nn.Module):
     def __init__(self, proto_net):
         super().__init__()
