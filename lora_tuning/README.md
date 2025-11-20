@@ -31,9 +31,17 @@ uv run loader.py path/to/network.pb.gz
 uv run test_model.py path/to/network.pb.gz
 ```
 
-### 4. Train
+### 4. Prepare Data
+The C++ dataloader requires data to be split into manageable chunks (to avoid OOM on large files).
+If you have a single large `train_data.gz`, run:
 ```bash
-uv run train.py --network path/to/network.pb.gz --data path/to/training/chunks --output tuned.pb.gz
+uv run split_data.py
+```
+This will create `data/chunks/`.
+
+### 5. Train
+```bash
+uv run train.py --network tuned_badgyal.pb.gz --data data --output tuned.pb.gz --batch_size 256 --steps 1000
 ```
 
 ## Files
@@ -41,5 +49,6 @@ uv run train.py --network path/to/network.pb.gz --data path/to/training/chunks -
 - `model.py`: PyTorch model definition (Lc0Net, LoRALayer, MHA, etc.) that mirrors the Lc0 C++ inference code.
 - `test_model.py`: Verification script.
 - `train.py`: Training loop using LoRA.
-- `dataset.py`: PyTorch IterableDataset wrapping `chunkparser.py`.
-- `chunkparser.py`: (From lczero-training) Parsing logic for binary training data.
+- `dataset.py`: PyTorch IterableDataset wrapping the high-performance C++ dataloader.
+- `lczero_training/`: Compiled C++ dataloader extension (from `lc0-training`).
+- `split_data.py`: Helper to split large training files.

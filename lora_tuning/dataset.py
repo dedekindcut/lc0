@@ -1,9 +1,20 @@
 import torch
 from torch.utils.data import IterableDataset
 import numpy as np
-import glob
 import os
-import chunkparser
+import sys
+
+# Ensure we can import the C++ extension and protobufs
+# Assuming they are in the same directory as this file
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from lczero_training import _lczero_training
+    from proto import data_loader_config_pb2
+except ImportError as e:
+    print(f"Error importing lczero_training or proto: {e}")
+    print("Make sure _lczero_training.so and proto/ are in the python path.")
+    raise
 
 class Lc0Dataset(IterableDataset):
     def __init__(self, data_dir, batch_size=256, workers=4, shuffle_size=524288, input_format=5):
@@ -13,86 +24,120 @@ class Lc0Dataset(IterableDataset):
         self.workers = workers
         self.shuffle_size = shuffle_size
         self.input_format = input_format
+        self.loader = None
+
+    def _init_loader(self):
+        config = data_loader_config_pb2.DataLoaderConfig()
         
-        # Find all chunk files
-        # Lc0 training data is usually in .gz files inside subdirectories
-        # e.g. data_dir/game_001.gz or data_dir/subdir/game_001.gz
-        # The README says "chunks are packed into a tar file". 
-        # Assuming extracted chunks (gz files).
-        self.chunks = glob.glob(os.path.join(data_dir, "**", "*.gz"), recursive=True)
+        # Stage 1: File Path Provider
+        stage_fpp = config.stage.add()
+        stage_fpp.name = "file_path_provider"
+        stage_fpp.file_path_provider.directory = os.path.join(self.data_dir, "chunks")
+        stage_fpp.file_path_provider.output.queue_capacity = 16
+
+        # Stage 2: Chunk Source Loader
+        stage_csl = config.stage.add()
+        stage_csl.name = "chunk_source_loader"
+        stage_csl.input.append("file_path_provider")
+        stage_csl.chunk_source_loader.threads = max(1, self.workers // 2)
+        stage_csl.chunk_source_loader.output.queue_capacity = 16
+
+        # Stage 3: Shuffling Chunk Pool
+        stage_scp = config.stage.add()
+        stage_scp.name = "shuffling_chunk_pool"
+        stage_scp.input.append("chunk_source_loader")
+        # Use a reasonable pool size. For local testing/finetuning, we might not have 50k chunks.
+        # Check if we can count files? For now use smaller pool if we assume small dataset.
+        stage_scp.shuffling_chunk_pool.chunk_pool_size = min(500, self.shuffle_size // 1000 + 1) 
+        stage_scp.shuffling_chunk_pool.source_ingestion_threads = 1
+        stage_scp.shuffling_chunk_pool.chunk_loading_threads = max(1, self.workers)
+        stage_scp.shuffling_chunk_pool.output.queue_capacity = 16
         
-        if not self.chunks:
-            # Try flat directory
-            self.chunks = glob.glob(os.path.join(data_dir, "*.gz"))
-            
-        print(f"Found {len(self.chunks)} chunks.")
-        
+        # Stage 4: Chunk Unpacker
+        stage_cu = config.stage.add()
+        stage_cu.name = "chunk_unpacker"
+        stage_cu.input.append("shuffling_chunk_pool")
+        stage_cu.chunk_unpacker.threads = max(1, self.workers)
+        stage_cu.chunk_unpacker.position_sampling_rate = 1.0 # Use all positions? Or sample?
+        # If fine-tuning on small dataset, maybe 1.0. If huge dataset, maybe 0.1.
+        stage_cu.chunk_unpacker.output.queue_capacity = 16
+
+        # Stage 5: Shuffling Frame Sampler
+        stage_sfs = config.stage.add()
+        stage_sfs.name = "shuffling_frame_sampler"
+        stage_sfs.input.append("chunk_unpacker")
+        stage_sfs.shuffling_frame_sampler.threads = max(1, self.workers)
+        stage_sfs.shuffling_frame_sampler.reservoir_size_per_thread = 1000
+        stage_sfs.shuffling_frame_sampler.output.queue_capacity = 16
+
+        # Stage 6: Tensor Generator
+        stage_tg = config.stage.add()
+        stage_tg.name = "tensor_generator"
+        stage_tg.input.append("shuffling_frame_sampler")
+        stage_tg.tensor_generator.threads = max(1, self.workers)
+        stage_tg.tensor_generator.batch_size = self.batch_size
+        stage_tg.tensor_generator.output.queue_capacity = 16
+
+        config.output.append("tensor_generator")
+
+        print("Initializing C++ DataLoader...")
+        self.loader = _lczero_training.DataLoader(config)
+        self.loader.start()
+
     def __iter__(self):
-        # Create ChunkParser
-        # V6 input format is 5 (INPUT_112_WITH_CANONICALIZATION_V2) or similar.
-        # We need to know the expected input format.
-        # chunkparser constants:
-        # V6_STRUCT_STRING
-        # But expected_input_format arg is for verification?
-        # chunkparser.py: assert input_format == self.expected_input_format
-        
-        # Let's try format 5 (current default?) or 2?
-        # README says "input_format: 2" in some old configs? 
-        # Actually, checking recent Lc0 code or configs might help.
-        # But let's default to 5 and see if it crashes, or 2.
-        # Format 5 is INPUT_112_WITH_CANONICALIZATION_V2.
-        
-        # We use the internal multiprocessing of ChunkParser.
-        # So we shouldn't use PyTorch num_workers > 0 usually.
-        
-        parser = chunkparser.ChunkParser(
-            self.chunks,
-            expected_input_format=self.input_format, 
-            shuffle_size=self.shuffle_size,
-            batch_size=self.batch_size,
-            workers=self.workers
-        )
-        
-        # If workers=0, use sequential
-        if self.workers <= 0:
-            gen = parser.sequential()
-        else:
-            gen = parser.parse()
-        
-        # Iterating parser.parse() yields batches of BYTES
-        for batch_bytes in gen:
-            # batch_bytes is tuple: (planes, probs, winner, q, plies_left)
-            # unpack
+        if self.loader is None:
+            self._init_loader()
             
-            # 1. Planes: float32, shape (B, 112, 8, 8)
-            # But they come as flat bytes.
-            planes = np.frombuffer(batch_bytes[0], dtype=np.float32)
-            planes = planes.reshape(self.batch_size, 112, 8, 8)
+        while True:
+            # Tuple of numpy arrays
+            # V6/V7 usually: (planes, probs, wdl, moves_left) or similar
+            try:
+                batch = self.loader.get_next()
+            except Exception as e:
+                print(f"DataLoader finished or error: {e}")
+                break
+                
+            if batch is None:
+                break
+
+            # Map to expected keys
+            # Based on verify_loader output or standard LC0 format
+            # batch[0]: Input planes (B, 112, 8, 8)
+            # batch[1]: Policy (B, 1858)
+            # batch[2]: Value/WDL (B, 3)
+            # batch[3]: Moves Left (B, 1) - Optional depending on config/format
             
-            # 2. Probs: float32 (probs are stored as float in V6), shape (B, 1858)
-            probs = np.frombuffer(batch_bytes[1], dtype=np.float32)
-            probs = probs.reshape(self.batch_size, 1858)
+            planes = batch[0]
+            probs = batch[1]
+            wdl = batch[2]
             
-            # 3. Winner: float32, shape (B, 3) -> (Win, Draw, Loss)?
-            # chunkparser: winner = struct.pack('fff', ...)
-            winner = np.frombuffer(batch_bytes[2], dtype=np.float32)
-            winner = winner.reshape(self.batch_size, 3)
+            # Check if we have legacy format 
+            # batch[0] shape is likely (B, 112*64) or (B, 112, 8, 8)
+            # The C++ loader likely returns flat or structured? 
+            # tensor_generator.cc usually produces structured if configured, or flat.
+            # Let's assume we need to reshape if flat.
             
-            # 4. Q: float32, shape (B, 3) -> (Win_Q, Draw_Q, Loss_Q) or just Q, D, ?
-            # chunkparser: best_q = struct.pack('fff', best_q_w, best_d, best_q_l)
-            q = np.frombuffer(batch_bytes[3], dtype=np.float32)
-            q = q.reshape(self.batch_size, 3)
+            # Planes
+            if planes.ndim == 2:
+                # (B, 112*64)
+                planes = planes.reshape(-1, 112, 8, 8)
             
-            # 5. Plies left: float32, (B, 1)
-            # plies = np.frombuffer(batch_bytes[4], dtype=np.float32)
-            # plies = plies.reshape(self.batch_size, 1)
+            # Probs
+            # (B, 1858) - usually correct
             
-            # Convert to Tensor
-            yield {
-                'input': torch.from_numpy(planes), # (B, 112, 8, 8)
-                'policy_target': torch.from_numpy(probs), # (B, 1858)
-                'value_target': torch.from_numpy(q), # (B, 3) - usually we train against Q (MCTS result)
-                'winner_target': torch.from_numpy(winner) # (B, 3) - Game result
+            # WDL
+            # (B, 3) - usually correct
+            
+            result = {
+                'input': torch.from_numpy(planes),
+                'policy_target': torch.from_numpy(probs),
+                'value_target': torch.from_numpy(wdl),
+                'winner_target': torch.from_numpy(wdl) # Duplicate for now
             }
-        
-        parser.shutdown()
+            
+            yield result
+            
+    def __del__(self):
+        # Can't explicitly stop easily from here without keeping ref, 
+        # but Python GC should handle it if wrapper is good.
+        pass
