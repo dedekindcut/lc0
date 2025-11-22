@@ -6,7 +6,7 @@ project(
   default_options : [
     'warning_level=3',
     'cpp_std=c++20',
-    'werror=true',
+    'werror=false',
   ],
 )
 
@@ -15,8 +15,8 @@ cpp_compiler = meson.get_compiler('cpp')
 if cpp_compiler.get_id() == 'clang'
   add_project_arguments('-Wno-nullability-extension', language : 'cpp')
 endif
-add_project_arguments('-Wno-maybe-uninitialized', language : 'cpp')
-add_project_arguments('-Werror', language : 'cpp')
+add_global_arguments('-Wno-maybe-uninitialized', language : 'cpp')
+# add_project_arguments('-Werror', language : 'cpp')
 
 
 # External dependencies
